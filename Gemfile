@@ -4,3 +4,5 @@ gem "newrelic_plugin"
 gem "daemons"
 gem 'sidekiq'
 gem 'redis'
+gem 'pry'
+gem 'faraday'

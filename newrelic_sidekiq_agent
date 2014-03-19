@@ -3,21 +3,45 @@
 require "rubygems"
 require "bundler/setup"
 require "newrelic_plugin"
+require 'faraday'
 
 require 'sidekiq'
 require 'sidekiq/api'
 require 'redis'
 
 module SidekiqStatusAgent
+  class Ccu
+    BASE_URL = 'https://api.ccu.akamai.com/ccu/v2/queues/default'
+
+    def self.queue_length(user, pass)
+      JSON.parse(self.check_queue(user, pass).body)['queueLength']
+    end
+
+    protected
+
+    def self.check_queue(user, pass)
+      connection(user, pass).get
+    end
+
+    def self.connection(user, pass)
+      @connection ||= Faraday.new(BASE_URL).tap do |conn|
+        conn.basic_auth(user, pass)
+      end
+    end
+  end
 
   class Agent < NewRelic::Plugin::Agent::Base
 
-    agent_guid "com.secondimpression.newrelic-sidekiq-agent"
-    agent_config_options :instance_name, :uri, :namespace
+    agent_guid "dtm_sidekiq_agent"
+    agent_config_options :instance_name, :uri, :namespace, :akamai_ccu_user, :akamai_ccu_password
     agent_version '0.0.2'
     agent_human_labels('Sidekiq') { instance_name }
 
     def setup_metrics
+      Sidekiq.configure_client do |config|
+        config.redis = { :url => uri, :namespace => namespace }
+      end
+
       @total_failed = NewRelic::Processor::EpochCounter.new
       @processed    = NewRelic::Processor::EpochCounter.new
     end
@@ -27,10 +51,6 @@ module SidekiqStatusAgent
         raise "Redis connection URL missing"
       end
 
-      Sidekiq.configure_client do |config|
-        config.redis = { :url => uri, :namespace => namespace }
-      end
-
       begin
         stats = Sidekiq::Stats.new
         workers = Sidekiq::Workers.new
@@ -38,6 +58,7 @@ module SidekiqStatusAgent
         report_metric "Workers/Working", "Workers",           workers.size
         report_metric "Jobs/Pending", "Jobs",                 stats.enqueued
         report_metric "Jobs/Processed", "Jobs",               stats.processed
+        report_metric "Akamai/purge", "Value",                Ccu.queue_length(akamai_ccu_user, akamai_ccu_password)
         report_metric "Jobs/Rate/Processed", "Jobs/Second",   @processed.process(stats.processed)
         report_metric "Jobs/Rate/Failed", "Jobs/Second",      @total_failed.process(stats.failed)
         report_metric "Jobs/Failed", "Jobs",                  stats.failed || 0
@@ -50,8 +71,10 @@ module SidekiqStatusAgent
         raise 'Redis server timeout'
       rescue  Redis::CannotConnectError, Redis::ConnectionError
         raise 'Could not connect to redis'
+      rescue Faraday::Error => e
+        raise "Queue check: #{e.message}"
       rescue Exception => e
-        raise 'Could not connect to redis'
+        raise "Exception: #{e.message}"
       end
     end
 
